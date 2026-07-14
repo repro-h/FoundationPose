@@ -99,9 +99,12 @@ def load_mesh_file(mesh_path: Path, mesh_scale: float) -> tuple[trimesh.Trimesh,
   mesh.vertices = np.asarray(mesh.vertices, dtype=np.float64) * float(mesh_scale)
   mesh.remove_unreferenced_vertices()
   return mesh, {
-    "decoded_scale": float(mesh_scale),
-    "final_global_scale": float(mesh_scale),
-    "scale_source": "mesh_file.mesh_scale",
+    # mesh_scale is already baked into the exported tracked_model_anchor
+    # vertices, so downstream consumers must apply a unit scale.
+    "decoded_scale": 1.0,
+    "final_global_scale": 1.0,
+    "scale_source": "mesh_file.baked_vertices",
+    "source_mesh_scale": float(mesh_scale),
   }
 
 
