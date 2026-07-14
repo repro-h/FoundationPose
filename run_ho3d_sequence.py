@@ -89,7 +89,10 @@ def load_mesh_file(mesh_path: Path, mesh_scale: float) -> tuple[trimesh.Trimesh,
     ]
     if not geometries:
       raise ValueError(f"No triangle geometry found in {mesh_path}")
-    loaded = trimesh.util.concatenate(geometries)
+    # FoundationPose accepts one Trimesh. Keep the largest geometry intact so
+    # TextureVisuals/UV/material data survive instead of being discarded by a
+    # generic scene concatenation.
+    loaded = max(geometries, key=lambda geometry: len(geometry.faces)).copy()
   if not isinstance(loaded, trimesh.Trimesh):
     raise ValueError(f"No triangle mesh found in {mesh_path}")
   mesh = loaded.copy()
