@@ -27,7 +27,15 @@ def parse_args() -> argparse.Namespace:
   )
   parser.add_argument("--ho3d_root", required=True, help="HO3D train root containing <sequence>/rgb.")
   parser.add_argument("--sequence", required=True)
-  parser.add_argument("--anchor_npz", required=True, help="Canonical MV/SAM3D anchor NPZ.")
+  model_group = parser.add_mutually_exclusive_group(required=True)
+  model_group.add_argument("--anchor_npz", help="Canonical MV/SAM3D anchor NPZ.")
+  model_group.add_argument("--mesh_file", help="Metric object mesh, such as a textured YCB CAD OBJ.")
+  parser.add_argument(
+    "--mesh_scale",
+    type=float,
+    default=1.0,
+    help="Scale applied to --mesh_file vertices. HO3D YCB models normally use 1.0.",
+  )
   parser.add_argument(
     "--scale_json",
     default=None,
@@ -69,6 +77,28 @@ def load_anchor_mesh(anchor_path: Path, scale_json_path: Path | None) -> tuple[t
     "decoded_scale": decoded_scale,
     "final_global_scale": final_scale,
     "scale_source": scale_source,
+  }
+
+
+def load_mesh_file(mesh_path: Path, mesh_scale: float) -> tuple[trimesh.Trimesh, dict[str, object]]:
+  loaded = trimesh.load(mesh_path, process=False)
+  if isinstance(loaded, trimesh.Scene):
+    geometries = [
+      geometry for geometry in loaded.geometry.values()
+      if hasattr(geometry, "vertices") and hasattr(geometry, "faces")
+    ]
+    if not geometries:
+      raise ValueError(f"No triangle geometry found in {mesh_path}")
+    loaded = trimesh.util.concatenate(geometries)
+  if not isinstance(loaded, trimesh.Trimesh):
+    raise ValueError(f"No triangle mesh found in {mesh_path}")
+  mesh = loaded.copy()
+  mesh.vertices = np.asarray(mesh.vertices, dtype=np.float64) * float(mesh_scale)
+  mesh.remove_unreferenced_vertices()
+  return mesh, {
+    "decoded_scale": float(mesh_scale),
+    "final_global_scale": float(mesh_scale),
+    "scale_source": "mesh_file.mesh_scale",
   }
 
 
@@ -165,7 +195,29 @@ def main() -> None:
   fp_debug_dir.mkdir(parents=True, exist_ok=True)
 
   scale_json_path = Path(args.scale_json).expanduser().resolve() if args.scale_json else None
-  mesh, scale_info = load_anchor_mesh(Path(args.anchor_npz).expanduser().resolve(), scale_json_path)
+  if args.mesh_file:
+    if scale_json_path is not None:
+      raise ValueError("--scale_json is only valid with --anchor_npz")
+    mesh_file_path = Path(args.mesh_file).expanduser().resolve()
+    mesh, scale_info = load_mesh_file(mesh_file_path, args.mesh_scale)
+    model_source = "mesh_file"
+    model_path = mesh_file_path
+  else:
+    mesh_file_path = None
+    model_path = Path(args.anchor_npz).expanduser().resolve()
+    mesh, scale_info = load_anchor_mesh(model_path, scale_json_path)
+    model_source = "anchor_npz"
+
+  tracked_anchor_path = None
+  if args.mesh_file:
+    tracked_anchor_path = out_dir / "tracked_model_anchor.npz"
+    np.savez_compressed(
+      tracked_anchor_path,
+      vertices=np.asarray(mesh.vertices, dtype=np.float32),
+      faces=np.asarray(mesh.faces, dtype=np.int64),
+      scale=np.asarray([1.0], dtype=np.float32),
+      source_model=np.asarray(str(model_path)),
+    )
   to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
   bbox = np.stack([-extents / 2.0, extents / 2.0], axis=0).reshape(2, 3)
 
@@ -237,7 +289,11 @@ def main() -> None:
       "pose_convention": "object_model_to_camera",
       "uses_gt_object_pose": False,
       "init_frame": init_frame,
-      "anchor_npz": str(Path(args.anchor_npz).expanduser().resolve()),
+      "model_source": model_source,
+      "model_path": str(model_path),
+      "anchor_npz": str(Path(args.anchor_npz).expanduser().resolve()) if args.anchor_npz else None,
+      "mesh_file": str(mesh_file_path) if mesh_file_path else None,
+      "tracked_model_anchor": str(tracked_anchor_path) if tracked_anchor_path else None,
       "scale_json": str(scale_json_path) if scale_json_path else None,
       **scale_info,
       "frames": rows,
