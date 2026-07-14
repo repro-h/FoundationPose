@@ -111,7 +111,10 @@ def load_intrinsics(meta_path: Path) -> np.ndarray:
     meta = pickle.load(handle, encoding="latin1")
   if "camMat" not in meta:
     raise KeyError(f"camMat missing from {meta_path}")
-  return np.asarray(meta["camMat"], dtype=np.float32).reshape(3, 3)
+  # trimesh stores vertices as float64 and FoundationPose's official readers
+  # likewise keep K in float64. Matching them avoids a torch matmul dtype error
+  # in compute_crop_window_tf_batch during registration.
+  return np.asarray(meta["camMat"], dtype=np.float64).reshape(3, 3)
 
 
 def pose_record(frame: str, pose: np.ndarray, mode: str, mask: np.ndarray, depth: np.ndarray) -> dict[str, object]:
