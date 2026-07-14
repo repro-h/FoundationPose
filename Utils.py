@@ -630,6 +630,10 @@ def compute_crop_window_tf_batch(pts=None, H=None, W=None, poses=None, K=None, c
 
 
 def cv_draw_text(img,text,uv_top_left,color=(255, 255, 255),fontScale=0.5,thickness=1,fontFace=cv2.FONT_HERSHEY_SIMPLEX,outline_color=None,line_spacing=1.5):
+  # OpenCV 5 requires drawing inputs to have CV_8U depth.  The score and
+  # refinement debug visualizers build their canvases from floating-point
+  # arrays, so normalize the storage type here for both call sites.
+  img = np.ascontiguousarray(np.clip(img, 0, 255).astype(np.uint8))
   H,W = img.shape[:2]
   uv_top_left = np.array(uv_top_left, dtype=float)
   assert uv_top_left.shape == (2,)
