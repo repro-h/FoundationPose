@@ -147,13 +147,61 @@ def load_intrinsics(meta_path: Path) -> np.ndarray:
     meta = pickle.load(handle, encoding="latin1")
   if "camMat" not in meta:
     raise KeyError(f"camMat missing from {meta_path}")
+  raw = meta["camMat"]
+  values = np.asarray(raw, dtype=np.float64)
+  if values.size != 9:
+    raise ValueError(
+      f"Invalid camMat in {meta_path}: expected 9 values, got "
+      f"shape={values.shape}, size={values.size}, value={raw!r}"
+    )
   # trimesh stores vertices as float64 and FoundationPose's official readers
   # likewise keep K in float64. Matching them avoids a torch matmul dtype error
   # in compute_crop_window_tf_batch during registration.
-  return np.asarray(meta["camMat"], dtype=np.float64).reshape(3, 3)
+  K = values.reshape(3, 3)
+  if not np.isfinite(K).all() or K[0, 0] <= 0 or K[1, 1] <= 0 or K[2, 2] == 0:
+    raise ValueError(f"Invalid camMat values in {meta_path}: {K.tolist()}")
+  return K
 
 
-def pose_record(frame: str, pose: np.ndarray, mode: str, mask: np.ndarray, depth: np.ndarray) -> dict[str, object]:
+def load_sequence_intrinsics(
+  meta_dir: Path,
+  frames: list[str],
+) -> tuple[dict[str, np.ndarray], dict[str, str]]:
+  """Load per-frame K, replacing malformed metadata with the nearest valid K."""
+  intrinsics: dict[str, np.ndarray] = {}
+  errors: dict[str, str] = {}
+  for frame in frames:
+    try:
+      intrinsics[frame] = load_intrinsics(meta_dir / f"{frame}.pkl")
+    except (FileNotFoundError, KeyError, TypeError, ValueError, pickle.UnpicklingError) as exc:
+      errors[frame] = f"{type(exc).__name__}: {exc}"
+
+  if not intrinsics:
+    examples = "; ".join(f"{frame}: {error}" for frame, error in list(errors.items())[:3])
+    raise ValueError(f"No valid camMat found in {meta_dir}. {examples}")
+
+  valid_frames = sorted(intrinsics, key=int)
+  fallback_sources: dict[str, str] = {}
+  for frame in errors:
+    source = min(valid_frames, key=lambda candidate: abs(int(candidate) - int(frame)))
+    intrinsics[frame] = intrinsics[source].copy()
+    fallback_sources[frame] = source
+    print(
+      f"[WARN] frame={frame} has invalid camMat; using nearest valid frame={source}. "
+      f"reason={errors[frame]}",
+      flush=True,
+    )
+  return intrinsics, fallback_sources
+
+
+def pose_record(
+  frame: str,
+  pose: np.ndarray,
+  mode: str,
+  mask: np.ndarray,
+  depth: np.ndarray,
+  intrinsics_source_frame: str,
+) -> dict[str, object]:
   valid_depth = mask & (depth >= 0.001)
   return {
     "frame": frame,
@@ -162,6 +210,8 @@ def pose_record(frame: str, pose: np.ndarray, mode: str, mask: np.ndarray, depth
     "mask_pixels": int(mask.sum()),
     "valid_mask_depth_pixels": int(valid_depth.sum()),
     "translation_m": np.asarray(pose[:3, 3], dtype=np.float64).tolist(),
+    "intrinsics_source_frame": intrinsics_source_frame,
+    "intrinsics_fallback": intrinsics_source_frame != frame,
   }
 
 
@@ -190,6 +240,7 @@ def main() -> None:
   if init_frame not in selected:
     raise ValueError("--init_frame must be included by the selected frame range/stride")
   selected = selected[selected.index(init_frame):]
+  intrinsics_by_frame, intrinsics_fallback_sources = load_sequence_intrinsics(meta_dir, selected)
 
   out_dir = Path(args.out_dir).expanduser().resolve()
   pose_path = out_dir / "foundationpose_poses.json"
@@ -246,7 +297,7 @@ def main() -> None:
     rgb = imageio.imread(by_frame[frame])[..., :3]
     depth = decode_ho3d_depth(find_frame_file(depth_dir, frame))
     mask = load_mask(find_frame_file(mask_dir, frame), rgb.shape[:2])
-    K = load_intrinsics(meta_dir / f"{frame}.pkl")
+    K = intrinsics_by_frame[frame]
     if depth.shape != rgb.shape[:2]:
       raise ValueError(f"Depth/RGB shape mismatch for {frame}: {depth.shape} vs {rgb.shape[:2]}")
 
@@ -270,7 +321,14 @@ def main() -> None:
     pose = np.asarray(pose, dtype=np.float64).reshape(4, 4)
     if not np.isfinite(pose).all():
       raise RuntimeError(f"FoundationPose returned a non-finite pose for frame {frame}")
-    rows[frame] = pose_record(frame, pose, mode, mask, depth)
+    rows[frame] = pose_record(
+      frame,
+      pose,
+      mode,
+      mask,
+      depth,
+      intrinsics_fallback_sources.get(frame, frame),
+    )
 
     np.savetxt(out_dir / f"{frame}.txt", pose)
     if args.save_overlays:
@@ -301,6 +359,8 @@ def main() -> None:
       "mesh_file": str(mesh_file_path) if mesh_file_path else None,
       "tracked_model_anchor": str(tracked_anchor_path) if tracked_anchor_path else None,
       "scale_json": str(scale_json_path) if scale_json_path else None,
+      "num_intrinsics_fallback_frames": len(intrinsics_fallback_sources),
+      "intrinsics_fallback_by_frame": intrinsics_fallback_sources,
       **scale_info,
       "frames": rows,
       "by_frame": rows,
