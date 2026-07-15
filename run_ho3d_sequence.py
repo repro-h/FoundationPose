@@ -12,10 +12,18 @@ from pathlib import Path
 import cv2
 import imageio.v2 as imageio
 import numpy as np
+import torch
 import trimesh
 
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
-from Utils import draw_posed_3d_box, draw_xyz_axis, dr, set_logging_format, set_seed
+from Utils import (
+  draw_posed_3d_box,
+  draw_xyz_axis,
+  dr,
+  nvdiffrast_render,
+  set_logging_format,
+  set_seed,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +53,30 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--start_frame", type=int, default=0)
   parser.add_argument("--end_frame", type=int, default=100)
   parser.add_argument("--init_frame", type=int, default=None)
+  parser.add_argument(
+    "--auto_init_frames",
+    type=int,
+    nargs="+",
+    default=None,
+    help="Independently register and score these candidate frames, then use the best one.",
+  )
+  parser.add_argument(
+    "--bidirectional",
+    action="store_true",
+    help="Track both forward and backward from the selected initialization frame.",
+  )
+  parser.add_argument(
+    "--auto_init_depth_tolerance_mm",
+    type=float,
+    default=12.0,
+    help="Occlusion tolerance used when scoring rendered candidate depth.",
+  )
+  parser.add_argument(
+    "--auto_init_score_tie_margin",
+    type=float,
+    default=0.02,
+    help="Prefer a temporally central candidate when its score is within this margin of the best.",
+  )
   parser.add_argument("--frame_stride", type=int, default=1, help="Tracking stride; keep 1 for reliable tracking.")
   parser.add_argument("--est_refine_iter", type=int, default=5)
   parser.add_argument("--track_refine_iter", type=int, default=2)
@@ -215,6 +247,72 @@ def pose_record(
   }
 
 
+def score_registered_pose(
+  estimator: FoundationPose,
+  pose: np.ndarray,
+  rgb: np.ndarray,
+  depth: np.ndarray,
+  mask: np.ndarray,
+  K: np.ndarray,
+  depth_tolerance_mm: float,
+) -> dict[str, float]:
+  """Score a registration using visible silhouette and RGB-D agreement."""
+  pose_tensor = torch.as_tensor(
+    np.asarray(pose, dtype=np.float32).reshape(1, 4, 4),
+    device="cuda",
+    dtype=torch.float32,
+  )
+  with torch.inference_mode():
+    _, rendered_depth, _ = nvdiffrast_render(
+      K=K,
+      H=rgb.shape[0],
+      W=rgb.shape[1],
+      ob_in_cams=pose_tensor,
+      glctx=estimator.glctx,
+      mesh_tensors=estimator.mesh_tensors,
+    )
+  rendered_depth_np = rendered_depth[0].detach().cpu().numpy()
+  rendered = np.isfinite(rendered_depth_np) & (rendered_depth_np >= 0.001)
+  scene_valid = np.isfinite(depth) & (depth >= 0.001)
+  tolerance_m = float(depth_tolerance_mm) / 1000.0
+
+  # Remove rendered pixels hidden by observed scene geometry, especially hand
+  # occlusion, before comparing against the visible object mask.
+  rendered_visible = rendered & (
+    ~scene_valid | (rendered_depth_np <= depth + tolerance_m)
+  )
+  intersection = rendered_visible & mask
+  union = rendered_visible | mask
+  iou = float(intersection.sum() / max(int(union.sum()), 1))
+  coverage = float(intersection.sum() / max(int(mask.sum()), 1))
+  precision = float(intersection.sum() / max(int(rendered_visible.sum()), 1))
+
+  depth_overlap = intersection & scene_valid
+  if depth_overlap.any():
+    residual = np.abs(rendered_depth_np[depth_overlap] - depth[depth_overlap])
+    depth_median_mm = float(np.median(residual) * 1000.0)
+    depth_p90_mm = float(np.quantile(residual, 0.9) * 1000.0)
+    depth_score = float(np.exp(-depth_median_mm / 20.0))
+  else:
+    depth_median_mm = float("inf")
+    depth_p90_mm = float("inf")
+    depth_score = 0.0
+
+  combined = 0.55 * iou + 0.20 * coverage + 0.10 * precision + 0.15 * depth_score
+  learned_score = float(torch.as_tensor(estimator.scores[0]).detach().cpu())
+  return {
+    "combined_score": float(combined),
+    "visible_mask_iou": iou,
+    "mask_coverage": coverage,
+    "render_precision": precision,
+    "depth_median_abs_mm": depth_median_mm,
+    "depth_p90_abs_mm": depth_p90_mm,
+    "foundationpose_score": learned_score,
+    "mask_pixels": int(mask.sum()),
+    "valid_mask_depth_pixels": int((mask & scene_valid).sum()),
+  }
+
+
 def main() -> None:
   args = parse_args()
   if args.frame_stride < 1:
@@ -239,7 +337,6 @@ def main() -> None:
   init_frame = f"{args.init_frame:04d}" if args.init_frame is not None else selected[0]
   if init_frame not in selected:
     raise ValueError("--init_frame must be included by the selected frame range/stride")
-  selected = selected[selected.index(init_frame):]
   intrinsics_by_frame, intrinsics_fallback_sources = load_sequence_intrinsics(meta_dir, selected)
 
   out_dir = Path(args.out_dir).expanduser().resolve()
@@ -292,60 +389,136 @@ def main() -> None:
     glctx=glctx,
   )
 
-  rows: dict[str, dict[str, object]] = {}
-  for index, frame in enumerate(selected):
+  def frame_inputs(frame: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     rgb = imageio.imread(by_frame[frame])[..., :3]
     depth = decode_ho3d_depth(find_frame_file(depth_dir, frame))
     mask = load_mask(find_frame_file(mask_dir, frame), rgb.shape[:2])
     K = intrinsics_by_frame[frame]
     if depth.shape != rgb.shape[:2]:
       raise ValueError(f"Depth/RGB shape mismatch for {frame}: {depth.shape} vs {rgb.shape[:2]}")
+    return rgb, depth, mask, K
 
-    if index == 0:
-      mode = "register"
-      pose = estimator.register(
-        K=K,
-        rgb=rgb,
-        depth=depth,
-        ob_mask=mask,
-        iteration=args.est_refine_iter,
-      )
-    else:
-      mode = "track"
-      pose = estimator.track_one(
-        rgb=rgb,
-        depth=depth,
-        K=K,
-        iteration=args.track_refine_iter,
-      )
-    pose = np.asarray(pose, dtype=np.float64).reshape(4, 4)
-    if not np.isfinite(pose).all():
-      raise RuntimeError(f"FoundationPose returned a non-finite pose for frame {frame}")
-    rows[frame] = pose_record(
-      frame,
-      pose,
-      mode,
-      mask,
-      depth,
-      intrinsics_fallback_sources.get(frame, frame),
+  def render_overlay(rgb: np.ndarray, K: np.ndarray, pose: np.ndarray) -> np.ndarray:
+    center_pose = pose @ np.linalg.inv(to_origin)
+    overlay = draw_posed_3d_box(K, img=rgb.copy(), ob_in_cam=center_pose, bbox=bbox)
+    return draw_xyz_axis(
+      overlay,
+      ob_in_cam=center_pose,
+      scale=max(float(np.max(extents)) * 0.6, 0.03),
+      K=K,
+      thickness=2,
+      transparency=0,
+      is_input_rgb=True,
     )
 
-    np.savetxt(out_dir / f"{frame}.txt", pose)
-    if args.save_overlays:
-      center_pose = pose @ np.linalg.inv(to_origin)
-      overlay = draw_posed_3d_box(K, img=rgb.copy(), ob_in_cam=center_pose, bbox=bbox)
-      overlay = draw_xyz_axis(
-        overlay,
-        ob_in_cam=center_pose,
-        scale=max(float(np.max(extents)) * 0.6, 0.03),
-        K=K,
-        thickness=2,
-        transparency=0,
-        is_input_rgb=True,
-      )
-      imageio.imwrite(overlay_dir / f"{frame}.jpg", overlay)
-    print(f"[{index + 1}/{len(selected)}] frame={frame} mode={mode} t={pose[:3, 3].tolist()}", flush=True)
+  candidate_diagnostics: list[dict[str, object]] = []
+  init_pose: np.ndarray | None = None
+  init_state = None
+  if args.auto_init_frames:
+    requested = {f"{value:04d}" for value in args.auto_init_frames}
+    candidate_frames = [frame for frame in selected if frame in requested]
+    missing = sorted(requested - set(candidate_frames))
+    if missing:
+      print(f"[WARN] auto-init candidates not selected/present: {missing}", flush=True)
+    if not candidate_frames:
+      raise ValueError("No valid --auto_init_frames remain in the selected frame range")
 
+    candidate_dir = out_dir / "init_candidates"
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    candidates: list[tuple[str, np.ndarray, object, dict[str, float]]] = []
+    for candidate_index, frame in enumerate(candidate_frames):
+      try:
+        rgb, depth, mask, K = frame_inputs(frame)
+        pose = estimator.register(
+          K=K,
+          rgb=rgb,
+          depth=depth,
+          ob_mask=mask,
+          iteration=args.est_refine_iter,
+        )
+        pose = np.asarray(pose, dtype=np.float64).reshape(4, 4)
+        metrics = score_registered_pose(
+          estimator,
+          pose,
+          rgb,
+          depth,
+          mask,
+          K,
+          args.auto_init_depth_tolerance_mm,
+        )
+        state = estimator.pose_last.detach().clone()
+        candidates.append((frame, pose.copy(), state, metrics))
+        diagnostic = {
+          "frame": frame,
+          "status": "valid",
+          "intrinsics_source_frame": intrinsics_fallback_sources.get(frame, frame),
+          **metrics,
+          "translation_m": pose[:3, 3].tolist(),
+        }
+        candidate_diagnostics.append(diagnostic)
+        np.savetxt(candidate_dir / f"{frame}.txt", pose)
+        imageio.imwrite(candidate_dir / f"{frame}.jpg", render_overlay(rgb, K, pose))
+        print(
+          f"[auto-init {candidate_index + 1}/{len(candidate_frames)}] frame={frame} "
+          f"score={metrics['combined_score']:.4f} iou={metrics['visible_mask_iou']:.4f} "
+          f"depth_med={metrics['depth_median_abs_mm']:.2f}mm",
+          flush=True,
+        )
+      except Exception as exc:
+        candidate_diagnostics.append({
+          "frame": frame,
+          "status": "failed",
+          "error": f"{type(exc).__name__}: {exc}",
+        })
+        print(f"[WARN] auto-init frame={frame} failed: {type(exc).__name__}: {exc}", flush=True)
+
+    if not candidates:
+      raise RuntimeError("Every automatic initialization candidate failed")
+    highest_score = max(item[3]["combined_score"] for item in candidates)
+    near_best = [
+      item for item in candidates
+      if item[3]["combined_score"] >= highest_score - args.auto_init_score_tie_margin
+    ]
+    temporal_center = (int(selected[0]) + int(selected[-1])) / 2.0
+    init_frame, init_pose, init_state, best_metrics = min(
+      near_best,
+      key=lambda item: abs(int(item[0]) - temporal_center),
+    )
+    print(
+      f"Selected auto-init frame={init_frame} score={best_metrics['combined_score']:.4f} "
+      f"iou={best_metrics['visible_mask_iou']:.4f} "
+      f"depth_med={best_metrics['depth_median_abs_mm']:.2f}mm",
+      flush=True,
+    )
+    (out_dir / "auto_init_scores.json").write_text(
+      json.dumps({
+        "selected_frame": init_frame,
+        "depth_tolerance_mm": args.auto_init_depth_tolerance_mm,
+        "score_tie_margin": args.auto_init_score_tie_margin,
+        "highest_candidate_score": highest_score,
+        "candidates": candidate_diagnostics,
+      }, indent=2),
+      encoding="utf-8",
+    )
+  else:
+    rgb, depth, mask, K = frame_inputs(init_frame)
+    init_pose = estimator.register(
+      K=K,
+      rgb=rgb,
+      depth=depth,
+      ob_mask=mask,
+      iteration=args.est_refine_iter,
+    )
+    init_pose = np.asarray(init_pose, dtype=np.float64).reshape(4, 4)
+    init_state = estimator.pose_last.detach().clone()
+
+  if init_pose is None or init_state is None:
+    raise RuntimeError("Failed to establish an initialization pose")
+
+  rows: dict[str, dict[str, object]] = {}
+
+  def write_payload() -> None:
+    ordered_rows = {frame: rows[frame] for frame in selected if frame in rows}
     payload = {
       "source": "foundationpose_ho3d_rgbd_tracking",
       "sequence": args.sequence,
@@ -353,6 +526,9 @@ def main() -> None:
       "pose_convention": "object_model_to_camera",
       "uses_gt_object_pose": False,
       "init_frame": init_frame,
+      "auto_init": bool(args.auto_init_frames),
+      "auto_init_candidates": candidate_diagnostics,
+      "bidirectional": bool(args.bidirectional),
       "model_source": model_source,
       "model_path": str(model_path),
       "anchor_npz": str(Path(args.anchor_npz).expanduser().resolve()) if args.anchor_npz else None,
@@ -362,14 +538,68 @@ def main() -> None:
       "num_intrinsics_fallback_frames": len(intrinsics_fallback_sources),
       "intrinsics_fallback_by_frame": intrinsics_fallback_sources,
       **scale_info,
-      "frames": rows,
-      "by_frame": rows,
+      "frames": ordered_rows,
+      "by_frame": ordered_rows,
     }
     tmp_path = pose_path.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     os.replace(tmp_path, pose_path)
 
-  print(json.dumps({"num_frames": len(rows), "pose_json": str(pose_path), **scale_info}, indent=2))
+  def save_result(frame: str, pose: np.ndarray, mode: str) -> None:
+    pose = np.asarray(pose, dtype=np.float64).reshape(4, 4)
+    if not np.isfinite(pose).all():
+      raise RuntimeError(f"FoundationPose returned a non-finite pose for frame {frame}")
+    rgb, depth, mask, K = frame_inputs(frame)
+    rows[frame] = pose_record(
+      frame,
+      pose,
+      mode,
+      mask,
+      depth,
+      intrinsics_fallback_sources.get(frame, frame),
+    )
+    np.savetxt(out_dir / f"{frame}.txt", pose)
+    if args.save_overlays:
+      imageio.imwrite(overlay_dir / f"{frame}.jpg", render_overlay(rgb, K, pose))
+    write_payload()
+    print(
+      f"[{len(rows)}/{len(selected)}] frame={frame} mode={mode} t={pose[:3, 3].tolist()}",
+      flush=True,
+    )
+
+  save_result(init_frame, init_pose, "register_auto" if args.auto_init_frames else "register")
+  init_index = selected.index(init_frame)
+
+  estimator.pose_last = init_state.detach().clone()
+  for frame in selected[init_index + 1:]:
+    rgb, depth, _, K = frame_inputs(frame)
+    pose = estimator.track_one(
+      rgb=rgb,
+      depth=depth,
+      K=K,
+      iteration=args.track_refine_iter,
+    )
+    save_result(frame, pose, "track_forward")
+
+  if args.bidirectional:
+    estimator.pose_last = init_state.detach().clone()
+    for frame in reversed(selected[:init_index]):
+      rgb, depth, _, K = frame_inputs(frame)
+      pose = estimator.track_one(
+        rgb=rgb,
+        depth=depth,
+        K=K,
+        iteration=args.track_refine_iter,
+      )
+      save_result(frame, pose, "track_backward")
+
+  print(json.dumps({
+    "num_frames": len(rows),
+    "pose_json": str(pose_path),
+    "selected_init_frame": init_frame,
+    "bidirectional": bool(args.bidirectional),
+    **scale_info,
+  }, indent=2))
 
 
 if __name__ == "__main__":
