@@ -80,6 +80,21 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--frame_stride", type=int, default=1, help="Tracking stride; keep 1 for reliable tracking.")
   parser.add_argument("--est_refine_iter", type=int, default=5)
   parser.add_argument("--track_refine_iter", type=int, default=2)
+  parser.add_argument(
+    "--score_weights_dir",
+    default=None,
+    help="Optional ScorePredictor directory containing config.yml and model_best.pth.",
+  )
+  parser.add_argument(
+    "--refine_weights_dir",
+    default=None,
+    help="Optional PoseRefinePredictor directory containing config.yml and model_best.pth.",
+  )
+  parser.add_argument(
+    "--rgb_only",
+    action="store_true",
+    help="Pass zero depth to FoundationPose, matching the GRAIL RGB-only finetuning setup.",
+  )
   parser.add_argument("--debug", type=int, default=1)
   parser.add_argument("--save_overlays", action="store_true")
   parser.add_argument("--overwrite", action="store_true")
@@ -375,8 +390,30 @@ def main() -> None:
   to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
   bbox = np.stack([-extents / 2.0, extents / 2.0], axis=0).reshape(2, 3)
 
-  scorer = ScorePredictor()
-  refiner = PoseRefinePredictor()
+  score_weights_dir = (
+    Path(args.score_weights_dir).expanduser().resolve()
+    if args.score_weights_dir else None
+  )
+  refine_weights_dir = (
+    Path(args.refine_weights_dir).expanduser().resolve()
+    if args.refine_weights_dir else None
+  )
+  for label, directory in (
+    ("score", score_weights_dir),
+    ("refine", refine_weights_dir),
+  ):
+    if directory is None:
+      continue
+    for filename in ("config.yml", "model_best.pth"):
+      if not (directory / filename).is_file():
+        raise FileNotFoundError(f"Missing {label} weight file: {directory / filename}")
+
+  scorer = ScorePredictor(
+    weights_dir=str(score_weights_dir) if score_weights_dir else None,
+  )
+  refiner = PoseRefinePredictor(
+    weights_dir=str(refine_weights_dir) if refine_weights_dir else None,
+  )
   glctx = dr.RasterizeCudaContext()
   estimator = FoundationPose(
     model_pts=np.asarray(mesh.vertices),
@@ -397,6 +434,9 @@ def main() -> None:
     if depth.shape != rgb.shape[:2]:
       raise ValueError(f"Depth/RGB shape mismatch for {frame}: {depth.shape} vs {rgb.shape[:2]}")
     return rgb, depth, mask, K
+
+  def estimator_depth(depth: np.ndarray) -> np.ndarray:
+    return np.zeros_like(depth) if args.rgb_only else depth
 
   def render_overlay(rgb: np.ndarray, K: np.ndarray, pose: np.ndarray) -> np.ndarray:
     center_pose = pose @ np.linalg.inv(to_origin)
@@ -432,7 +472,7 @@ def main() -> None:
         pose = estimator.register(
           K=K,
           rgb=rgb,
-          depth=depth,
+          depth=estimator_depth(depth),
           ob_mask=mask,
           iteration=args.est_refine_iter,
         )
@@ -505,7 +545,7 @@ def main() -> None:
     init_pose = estimator.register(
       K=K,
       rgb=rgb,
-      depth=depth,
+      depth=estimator_depth(depth),
       ob_mask=mask,
       iteration=args.est_refine_iter,
     )
@@ -525,6 +565,9 @@ def main() -> None:
       "coordinate_system": "opencv_camera",
       "pose_convention": "object_model_to_camera",
       "uses_gt_object_pose": False,
+      "foundationpose_input_mode": "rgb_only" if args.rgb_only else "rgbd",
+      "score_weights_dir": str(score_weights_dir) if score_weights_dir else "default",
+      "refine_weights_dir": str(refine_weights_dir) if refine_weights_dir else "default",
       "init_frame": init_frame,
       "auto_init": bool(args.auto_init_frames),
       "auto_init_candidates": candidate_diagnostics,
@@ -575,7 +618,7 @@ def main() -> None:
     rgb, depth, _, K = frame_inputs(frame)
     pose = estimator.track_one(
       rgb=rgb,
-      depth=depth,
+      depth=estimator_depth(depth),
       K=K,
       iteration=args.track_refine_iter,
     )
@@ -587,7 +630,7 @@ def main() -> None:
       rgb, depth, _, K = frame_inputs(frame)
       pose = estimator.track_one(
         rgb=rgb,
-        depth=depth,
+        depth=estimator_depth(depth),
         K=K,
         iteration=args.track_refine_iter,
       )
