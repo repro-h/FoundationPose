@@ -93,7 +93,11 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--rgb_only",
     action="store_true",
-    help="Pass zero depth to FoundationPose, matching the GRAIL RGB-only finetuning setup.",
+    help=(
+      "Use RGB-D for initial registration, then pass zero depth during tracking. "
+      "GRAIL uses RGB-only tracking but starts from a known first-frame pose; "
+      "HO3D registration still needs depth to initialize translation."
+    ),
   )
   parser.add_argument("--debug", type=int, default=1)
   parser.add_argument("--save_overlays", action="store_true")
@@ -314,7 +318,12 @@ def score_registered_pose(
     depth_score = 0.0
 
   combined = 0.55 * iou + 0.20 * coverage + 0.10 * precision + 0.15 * depth_score
-  learned_score = float(torch.as_tensor(estimator.scores[0]).detach().cpu())
+  learned_scores = getattr(estimator, "scores", None)
+  learned_score = (
+    float(torch.as_tensor(learned_scores[0]).detach().cpu())
+    if learned_scores is not None and len(learned_scores) > 0
+    else float("nan")
+  )
   return {
     "combined_score": float(combined),
     "visible_mask_iou": iou,
@@ -435,7 +444,7 @@ def main() -> None:
       raise ValueError(f"Depth/RGB shape mismatch for {frame}: {depth.shape} vs {rgb.shape[:2]}")
     return rgb, depth, mask, K
 
-  def estimator_depth(depth: np.ndarray) -> np.ndarray:
+  def tracking_depth(depth: np.ndarray) -> np.ndarray:
     return np.zeros_like(depth) if args.rgb_only else depth
 
   def render_overlay(rgb: np.ndarray, K: np.ndarray, pose: np.ndarray) -> np.ndarray:
@@ -472,7 +481,7 @@ def main() -> None:
         pose = estimator.register(
           K=K,
           rgb=rgb,
-          depth=estimator_depth(depth),
+          depth=depth,
           ob_mask=mask,
           iteration=args.est_refine_iter,
         )
@@ -545,7 +554,7 @@ def main() -> None:
     init_pose = estimator.register(
       K=K,
       rgb=rgb,
-      depth=estimator_depth(depth),
+      depth=depth,
       ob_mask=mask,
       iteration=args.est_refine_iter,
     )
@@ -565,7 +574,9 @@ def main() -> None:
       "coordinate_system": "opencv_camera",
       "pose_convention": "object_model_to_camera",
       "uses_gt_object_pose": False,
-      "foundationpose_input_mode": "rgb_only" if args.rgb_only else "rgbd",
+      "foundationpose_input_mode": (
+        "rgbd_register_rgb_only_track" if args.rgb_only else "rgbd"
+      ),
       "score_weights_dir": str(score_weights_dir) if score_weights_dir else "default",
       "refine_weights_dir": str(refine_weights_dir) if refine_weights_dir else "default",
       "init_frame": init_frame,
@@ -618,7 +629,7 @@ def main() -> None:
     rgb, depth, _, K = frame_inputs(frame)
     pose = estimator.track_one(
       rgb=rgb,
-      depth=estimator_depth(depth),
+      depth=tracking_depth(depth),
       K=K,
       iteration=args.track_refine_iter,
     )
@@ -630,7 +641,7 @@ def main() -> None:
       rgb, depth, _, K = frame_inputs(frame)
       pose = estimator.track_one(
         rgb=rgb,
-        depth=estimator_depth(depth),
+        depth=tracking_depth(depth),
         K=K,
         iteration=args.track_refine_iter,
       )
