@@ -81,6 +81,27 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--est_refine_iter", type=int, default=5)
   parser.add_argument("--track_refine_iter", type=int, default=2)
   parser.add_argument(
+    "--depth_source",
+    choices=["ho3d", "pi3_pointmap"],
+    default="ho3d",
+    help="Use HO3D RGB-D or metric Pi3 OpenCV-camera pointmaps as observed depth.",
+  )
+  parser.add_argument(
+    "--pi3_pointmap_dir",
+    default=None,
+    help="Directory containing per-frame Pi3 HxWx3 pointmaps.",
+  )
+  parser.add_argument(
+    "--pi3_pointmap_pattern",
+    default="{frame}_pi3_pointmap_opencv.npy",
+    help="Filename or glob pattern under --pi3_pointmap_dir; {frame} is replaced.",
+  )
+  parser.add_argument(
+    "--pi3_pointmap_key",
+    default="pointmap",
+    help="Preferred array key when a Pi3 pointmap is stored as NPZ.",
+  )
+  parser.add_argument(
     "--score_weights_dir",
     default=None,
     help="Optional ScorePredictor directory containing config.yml and model_best.pth.",
@@ -173,6 +194,56 @@ def decode_ho3d_depth(path: Path) -> np.ndarray:
       depth /= 1000.0
   depth[~np.isfinite(depth) | (depth < 0.001)] = 0.0
   return depth
+
+
+def resolve_pi3_pointmap_path(directory: Path, pattern: str, frame: str) -> Path:
+  formatted = pattern.format(frame=frame)
+  if any(token in formatted for token in ("*", "?", "[")):
+    matches = sorted(directory.glob(formatted))
+  else:
+    candidate = directory / formatted
+    matches = [candidate] if candidate.is_file() else []
+  if len(matches) != 1:
+    raise FileNotFoundError(
+      f"Expected exactly one Pi3 pointmap for frame={frame}, pattern={formatted!r}, "
+      f"directory={directory}; found={matches[:5]}"
+    )
+  return matches[0]
+
+
+def load_pi3_pointmap_depth(
+  path: Path,
+  image_hw: tuple[int, int],
+  preferred_key: str,
+) -> np.ndarray:
+  loaded = np.load(path, allow_pickle=False)
+  if isinstance(loaded, np.lib.npyio.NpzFile):
+    try:
+      key = preferred_key if preferred_key in loaded.files else loaded.files[0]
+      pointmap = np.asarray(loaded[key], dtype=np.float32)
+    finally:
+      loaded.close()
+  else:
+    pointmap = np.asarray(loaded, dtype=np.float32)
+  if pointmap.ndim != 3:
+    raise ValueError(f"Pi3 pointmap must be rank 3, got {pointmap.shape} from {path}")
+  if pointmap.shape[-1] == 3:
+    pass
+  elif pointmap.shape[0] == 3:
+    pointmap = pointmap.transpose(1, 2, 0)
+  else:
+    raise ValueError(f"Pi3 pointmap must be HxWx3 or 3xHxW, got {pointmap.shape} from {path}")
+
+  depth = pointmap[..., 2].copy()
+  depth[~np.isfinite(depth) | (depth < 0.001)] = 0.0
+  if depth.shape != image_hw:
+    depth = cv2.resize(
+      depth,
+      (image_hw[1], image_hw[0]),
+      interpolation=cv2.INTER_NEAREST,
+    )
+  depth[~np.isfinite(depth) | (depth < 0.001)] = 0.0
+  return depth.astype(np.float32)
 
 
 def load_mask(path: Path, image_hw: tuple[int, int]) -> np.ndarray:
@@ -355,6 +426,15 @@ def main() -> None:
   sequence_dir = Path(args.ho3d_root).expanduser().resolve() / args.sequence
   rgb_dir = sequence_dir / "rgb"
   depth_dir = sequence_dir / "depth"
+  pi3_pointmap_dir = (
+    Path(args.pi3_pointmap_dir).expanduser().resolve()
+    if args.pi3_pointmap_dir else None
+  )
+  if args.depth_source == "pi3_pointmap":
+    if pi3_pointmap_dir is None:
+      raise ValueError("--depth_source pi3_pointmap requires --pi3_pointmap_dir")
+    if not pi3_pointmap_dir.is_dir():
+      raise FileNotFoundError(f"Pi3 pointmap directory does not exist: {pi3_pointmap_dir}")
   mask_dir = sequence_dir / "obj_mask_white"
   meta_dir = sequence_dir / "meta"
   all_rgb = sorted(rgb_dir.glob("*.jpg")) + sorted(rgb_dir.glob("*.png"))
@@ -444,13 +524,28 @@ def main() -> None:
   )
 
   missing_mask_frames: set[str] = set()
+  pi3_depth_cache: dict[str, np.ndarray] = {}
 
   def frame_inputs(
     frame: str,
     require_mask: bool = True,
   ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     rgb = imageio.imread(by_frame[frame])[..., :3]
-    depth = decode_ho3d_depth(find_frame_file(depth_dir, frame))
+    if args.depth_source == "pi3_pointmap":
+      if frame not in pi3_depth_cache:
+        pointmap_path = resolve_pi3_pointmap_path(
+          pi3_pointmap_dir,
+          args.pi3_pointmap_pattern,
+          frame,
+        )
+        pi3_depth_cache[frame] = load_pi3_pointmap_depth(
+          pointmap_path,
+          rgb.shape[:2],
+          args.pi3_pointmap_key,
+        )
+      depth = pi3_depth_cache[frame]
+    else:
+      depth = decode_ho3d_depth(find_frame_file(depth_dir, frame))
     try:
       mask = load_mask(find_frame_file(mask_dir, frame), rgb.shape[:2])
     except FileNotFoundError:
@@ -622,8 +717,12 @@ def main() -> None:
       "pose_convention": "object_model_to_camera",
       "uses_gt_object_pose": False,
       "foundationpose_input_mode": (
-        "rgbd_register_rgb_only_track" if args.rgb_only else "rgbd"
+        f"{args.depth_source}_register_rgb_only_track"
+        if args.rgb_only else f"{args.depth_source}_register_and_track"
       ),
+      "depth_source": args.depth_source,
+      "pi3_pointmap_dir": str(pi3_pointmap_dir) if pi3_pointmap_dir else None,
+      "pi3_pointmap_pattern": args.pi3_pointmap_pattern if pi3_pointmap_dir else None,
       "score_weights_dir": str(score_weights_dir) if score_weights_dir else "default",
       "refine_weights_dir": str(refine_weights_dir) if refine_weights_dir else "default",
       "init_frame": init_frame,
