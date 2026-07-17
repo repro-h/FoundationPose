@@ -337,6 +337,14 @@ def score_registered_pose(
   }
 
 
+def is_cuda_oom(exc: BaseException) -> bool:
+  message = str(exc).lower()
+  return isinstance(exc, torch.OutOfMemoryError) or any(
+    marker in message
+    for marker in ("cuda out of memory", "cuda error: 2", "cudamalloc")
+  )
+
+
 def main() -> None:
   args = parse_args()
   if args.frame_stride < 1:
@@ -514,12 +522,26 @@ def main() -> None:
           flush=True,
         )
       except Exception as exc:
-        candidate_diagnostics.append({
+        diagnostic = {
           "frame": frame,
           "status": "failed",
           "error": f"{type(exc).__name__}: {exc}",
-        })
+        }
+        candidate_diagnostics.append(diagnostic)
         print(f"[WARN] auto-init frame={frame} failed: {type(exc).__name__}: {exc}", flush=True)
+        if is_cuda_oom(exc):
+          (out_dir / "auto_init_scores.json").write_text(
+            json.dumps({
+              "selected_frame": None,
+              "depth_tolerance_mm": args.auto_init_depth_tolerance_mm,
+              "score_tie_margin": args.auto_init_score_tie_margin,
+              "highest_candidate_score": None,
+              "candidates": candidate_diagnostics,
+              "aborted_reason": "cuda_out_of_memory",
+            }, indent=2),
+            encoding="utf-8",
+          )
+          raise
 
     auto_init_payload = {
       "selected_frame": None,
