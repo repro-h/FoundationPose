@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+import numpy as np
+
 
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(
@@ -162,6 +164,26 @@ def resolve_mv_glb(
   return max(candidates, key=lambda path: path.stat().st_mtime).resolve(), "visualization_fallback"
 
 
+def resolve_mv_mesh_scale(mesh_path: Path) -> tuple[float, Path]:
+  """Read the uniform metric scale saved beside an MV-SAM3D result mesh."""
+  params_path = mesh_path.parent / "params.npz"
+  if not params_path.is_file():
+    raise FileNotFoundError(f"Missing MV-SAM3D scale parameters: {params_path}")
+  with np.load(params_path, allow_pickle=True) as payload:
+    if "scale" not in payload:
+      raise KeyError(f"No scale array in {params_path}")
+    values = np.asarray(payload["scale"], dtype=np.float64).reshape(-1)
+  values = values[np.isfinite(values)]
+  if not values.size or np.any(values <= 0):
+    raise ValueError(f"Invalid MV-SAM3D scale in {params_path}: {values.tolist()}")
+  scale = float(np.median(values))
+  if not np.allclose(values, scale, rtol=1e-4, atol=1e-7):
+    raise ValueError(
+      f"FoundationPose requires a uniform mesh scale, got {values.tolist()} in {params_path}"
+    )
+  return scale, params_path.resolve()
+
+
 def sequence_rgb_frames(sequence_dir: Path) -> list[str]:
   rgb_dir = sequence_dir / "rgb"
   paths = list(rgb_dir.glob("*.jpg")) + list(rgb_dir.glob("*.png"))
@@ -271,6 +293,7 @@ def validate_pose_json(
   expected_frames: Iterable[str],
   expected_mesh: Path,
   min_coverage: float,
+  expected_mesh_scale: float | None = None,
 ) -> tuple[bool, dict[str, Any]]:
   if not pose_path.is_file():
     return False, {"reason": "missing_pose_json"}
@@ -289,12 +312,23 @@ def validate_pose_json(
       same_mesh = Path(model_path).expanduser().resolve() == expected_mesh.resolve()
     except OSError:
       same_mesh = False
+  actual_mesh_scale = payload.get("source_mesh_scale")
+  same_scale = expected_mesh_scale is None
+  if expected_mesh_scale is not None and actual_mesh_scale is not None:
+    try:
+      same_scale = math.isclose(
+        float(actual_mesh_scale), float(expected_mesh_scale), rel_tol=1e-5, abs_tol=1e-7,
+      )
+    except (TypeError, ValueError):
+      same_scale = False
   diagnostics = {
     "coverage": coverage,
     "num_expected_frames": len(expected),
     "num_pose_frames": len(present),
     "model_path": model_path,
     "expected_mesh": str(expected_mesh),
+    "mesh_scale": actual_mesh_scale,
+    "expected_mesh_scale": expected_mesh_scale,
     "bidirectional": bool(payload.get("bidirectional")),
     "uses_gt_object_pose": payload.get("uses_gt_object_pose"),
   }
@@ -302,6 +336,7 @@ def validate_pose_json(
     coverage >= min_coverage
     and payload.get("model_source") == "mesh_file"
     and same_mesh
+    and same_scale
     and bool(payload.get("bidirectional"))
     and payload.get("uses_gt_object_pose") is False
   )
@@ -315,6 +350,7 @@ def command_for_job(
   frames: list[str],
   candidates: list[dict[str, Any]],
   mesh_path: Path,
+  mesh_scale: float,
   out_dir: Path,
   overwrite_output: bool,
 ) -> list[str]:
@@ -324,7 +360,7 @@ def command_for_job(
     "--ho3d_root", str(Path(args.ho3d_root).expanduser()),
     "--sequence", sequence,
     "--mesh_file", str(mesh_path),
-    "--mesh_scale", "1.0",
+    "--mesh_scale", f"{mesh_scale:.12g}",
     "--out_dir", str(out_dir),
     "--start_frame", str(int(frames[0])),
     "--end_frame", str(int(frames[-1])),
@@ -449,6 +485,7 @@ def main() -> None:
       mesh_path, mesh_source = resolve_mv_glb(sequence, status_payload, visualization_root)
       if mesh_path is None:
         raise FileNotFoundError(f"No MV-SAM3D result.glb found for {sequence}")
+      mesh_scale, mesh_params_path = resolve_mv_mesh_scale(mesh_path)
       sequence_dir = ho3d_root / sequence
       frames = sequence_rgb_frames(sequence_dir)
       candidates, rejected = select_init_candidates(
@@ -464,10 +501,13 @@ def main() -> None:
       pose_path = out_dir / "foundationpose_poses.json"
       valid, validation = validate_pose_json(
         pose_path, frames, mesh_path, args.min_pose_coverage,
+        expected_mesh_scale=mesh_scale,
       )
       job.update({
         "mv_glb": str(mesh_path),
         "mv_glb_source": mesh_source,
+        "mv_params_npz": str(mesh_params_path),
+        "mv_mesh_scale": mesh_scale,
         "out_dir": str(out_dir),
         "pose_json": str(pose_path),
         "num_rgb_frames": len(frames),
@@ -487,6 +527,7 @@ def main() -> None:
           frames,
           candidates,
           mesh_path,
+          mesh_scale,
           out_dir,
           overwrite_output=args.force or pose_path.exists(),
         )
@@ -516,6 +557,7 @@ def main() -> None:
               raise
           valid, validation = validate_pose_json(
             pose_path, frames, mesh_path, args.min_pose_coverage,
+            expected_mesh_scale=mesh_scale,
           )
           job["validation_after"] = validation
           if not valid:

@@ -127,7 +127,7 @@ def main() -> None:
     available,
     args.frame_stride,
     args.frames,
-    payload.get("selected_init_frame"),
+    payload.get("selected_init_frame", payload.get("init_frame")),
   )
 
   sequence_dir = Path(args.ho3d_root).expanduser().resolve() / args.sequence

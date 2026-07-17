@@ -3,10 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from run_ho3d_approved_batch import (
   approved_sequence_entries,
   choose_distributed_candidates,
   resolve_mv_glb,
+  resolve_mv_mesh_scale,
   summarize_failure_log,
   validate_pose_json,
 )
@@ -78,6 +81,16 @@ class ApprovedBatchTests(unittest.TestCase):
       self.assertEqual(path, fallback.resolve())
       self.assertEqual(source, "visualization_fallback")
 
+  def test_mv_mesh_scale_comes_from_result_params(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      mesh = root / "result.glb"
+      mesh.touch()
+      np.savez(root / "params.npz", scale=np.asarray([0.19, 0.19, 0.19]))
+      scale, params = resolve_mv_mesh_scale(mesh)
+      self.assertAlmostEqual(scale, 0.19)
+      self.assertEqual(params, (root / "params.npz").resolve())
+
   def test_pose_validation_requires_full_matching_mv_track(self):
     with tempfile.TemporaryDirectory() as temporary:
       root = Path(temporary)
@@ -87,20 +100,30 @@ class ApprovedBatchTests(unittest.TestCase):
       pose_path.write_text(json.dumps({
         "model_source": "mesh_file",
         "model_path": str(mesh),
+        "source_mesh_scale": 0.19,
         "bidirectional": True,
         "uses_gt_object_pose": False,
         "by_frame": {"0000": {}, "0001": {}, "0002": {}},
       }))
       valid, diagnostics = validate_pose_json(
         pose_path, ["0000", "0001", "0002"], mesh, 1.0,
+        expected_mesh_scale=0.19,
       )
       self.assertTrue(valid, diagnostics)
 
       valid, diagnostics = validate_pose_json(
         pose_path, ["0000", "0001", "0002", "0003"], mesh, 1.0,
+        expected_mesh_scale=0.19,
       )
       self.assertFalse(valid)
       self.assertEqual(diagnostics["coverage"], 0.75)
+
+      valid, diagnostics = validate_pose_json(
+        pose_path, ["0000", "0001", "0002"], mesh, 1.0,
+        expected_mesh_scale=1.0,
+      )
+      self.assertFalse(valid)
+      self.assertEqual(diagnostics["mesh_scale"], 0.19)
 
 
 if __name__ == "__main__":
