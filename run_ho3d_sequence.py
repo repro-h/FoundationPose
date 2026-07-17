@@ -521,7 +521,18 @@ def main() -> None:
         })
         print(f"[WARN] auto-init frame={frame} failed: {type(exc).__name__}: {exc}", flush=True)
 
+    auto_init_payload = {
+      "selected_frame": None,
+      "depth_tolerance_mm": args.auto_init_depth_tolerance_mm,
+      "score_tie_margin": args.auto_init_score_tie_margin,
+      "highest_candidate_score": None,
+      "candidates": candidate_diagnostics,
+    }
     if not candidates:
+      (out_dir / "auto_init_scores.json").write_text(
+        json.dumps(auto_init_payload, indent=2),
+        encoding="utf-8",
+      )
       raise RuntimeError("Every automatic initialization candidate failed")
     highest_score = max(item[3]["combined_score"] for item in candidates)
     near_best = [
@@ -539,14 +550,12 @@ def main() -> None:
       f"depth_med={best_metrics['depth_median_abs_mm']:.2f}mm",
       flush=True,
     )
+    auto_init_payload.update({
+      "selected_frame": init_frame,
+      "highest_candidate_score": highest_score,
+    })
     (out_dir / "auto_init_scores.json").write_text(
-      json.dumps({
-        "selected_frame": init_frame,
-        "depth_tolerance_mm": args.auto_init_depth_tolerance_mm,
-        "score_tie_margin": args.auto_init_score_tie_margin,
-        "highest_candidate_score": highest_score,
-        "candidates": candidate_diagnostics,
-      }, indent=2),
+      json.dumps(auto_init_payload, indent=2),
       encoding="utf-8",
     )
   else:

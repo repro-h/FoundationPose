@@ -391,7 +391,15 @@ def summarize_failure_log(log_path: Path, max_lines: int = 40) -> dict[str, Any]
   if len(tail) > max_lines:
     tail = tail[-max_lines:]
   summary = next((line.strip() for line in reversed(tail) if line.strip()), "unknown worker error")
-  return {"error_summary": summary, "error_tail": tail}
+  candidate_failures = [
+    line.strip() for line in lines
+    if "[WARN] auto-init frame=" in line and " failed:" in line
+  ]
+  return {
+    "error_summary": summary,
+    "error_tail": tail,
+    "candidate_failure_summaries": candidate_failures[-16:],
+  }
 
 
 def main() -> None:
@@ -544,6 +552,9 @@ def main() -> None:
         "split": state["jobs"].get(sequence, {}).get("split"),
         "error": state["jobs"].get(sequence, {}).get("error"),
         "error_summary": state["jobs"].get(sequence, {}).get("error_summary"),
+        "candidate_failure_summaries": state["jobs"].get(sequence, {}).get(
+          "candidate_failure_summaries", []
+        ),
         "log": state["jobs"].get(sequence, {}).get("log"),
       }
       for sequence in sequences

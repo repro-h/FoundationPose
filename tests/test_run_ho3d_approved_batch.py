@@ -17,6 +17,7 @@ class ApprovedBatchTests(unittest.TestCase):
     with tempfile.TemporaryDirectory() as temporary:
       path = Path(temporary) / "worker.log"
       path.write_text(
+        "[WARN] auto-init frame=0001 failed: ValueError: bad depth\n"
         "old output\nTraceback (most recent call last):\nold failure\n"
         "progress\nTraceback (most recent call last):\nlast detail\n"
         "RuntimeError: final failure\n",
@@ -25,6 +26,10 @@ class ApprovedBatchTests(unittest.TestCase):
       result = summarize_failure_log(path)
       self.assertEqual(result["error_summary"], "RuntimeError: final failure")
       self.assertEqual(result["error_tail"][0], "Traceback (most recent call last):")
+      self.assertEqual(
+        result["candidate_failure_summaries"],
+        ["[WARN] auto-init frame=0001 failed: ValueError: bad depth"],
+      )
 
   def test_approved_sequence_variants(self):
     self.assertEqual(
