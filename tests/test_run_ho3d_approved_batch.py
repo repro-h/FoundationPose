@@ -7,11 +7,25 @@ from run_ho3d_approved_batch import (
   approved_sequence_entries,
   choose_distributed_candidates,
   resolve_mv_glb,
+  summarize_failure_log,
   validate_pose_json,
 )
 
 
 class ApprovedBatchTests(unittest.TestCase):
+  def test_summarize_failure_log_uses_final_error(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      path = Path(temporary) / "worker.log"
+      path.write_text(
+        "old output\nTraceback (most recent call last):\nold failure\n"
+        "progress\nTraceback (most recent call last):\nlast detail\n"
+        "RuntimeError: final failure\n",
+        encoding="utf-8",
+      )
+      result = summarize_failure_log(path)
+      self.assertEqual(result["error_summary"], "RuntimeError: final failure")
+      self.assertEqual(result["error_tail"][0], "Traceback (most recent call last):")
+
   def test_approved_sequence_variants(self):
     self.assertEqual(
       approved_sequence_entries({

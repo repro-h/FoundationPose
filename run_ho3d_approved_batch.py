@@ -360,6 +360,40 @@ def clean_subprocess_environment(python_path: Path, cuda_visible_devices: str) -
   return environment
 
 
+def summarize_failure_log(log_path: Path, max_lines: int = 40) -> dict[str, Any]:
+  """Extract the final traceback or error tail from a failed worker log."""
+  if not log_path.is_file():
+    return {"error_summary": "worker log is missing", "error_tail": []}
+  lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+  markers = (
+    "Traceback (most recent call last):",
+    "RuntimeError:",
+    "ValueError:",
+    "FileNotFoundError:",
+    "torch.OutOfMemoryError:",
+    "CUDA error",
+  )
+  traceback_indices = [
+    index for index, line in enumerate(lines)
+    if "Traceback (most recent call last):" in line
+  ]
+  marker_indices = [
+    index for index, line in enumerate(lines)
+    if any(marker in line for marker in markers)
+  ]
+  if traceback_indices:
+    start = traceback_indices[-1]
+  elif marker_indices:
+    start = marker_indices[-1]
+  else:
+    start = max(0, len(lines) - max_lines)
+  tail = lines[start:]
+  if len(tail) > max_lines:
+    tail = tail[-max_lines:]
+  summary = next((line.strip() for line in reversed(tail) if line.strip()), "unknown worker error")
+  return {"error_summary": summary, "error_tail": tail}
+
+
 def main() -> None:
   args = parse_args()
   if not 0 < args.min_pose_coverage <= 1:
@@ -459,14 +493,19 @@ def main() -> None:
           with log_path.open("w", encoding="utf-8") as log_handle:
             log_handle.write("COMMAND\n" + " ".join(command) + "\n\n")
             log_handle.flush()
-            subprocess.run(
-              command,
-              cwd=str(Path(args.runner_path).expanduser().resolve().parent),
-              env=environment,
-              stdout=log_handle,
-              stderr=subprocess.STDOUT,
-              check=True,
-            )
+            try:
+              subprocess.run(
+                command,
+                cwd=str(Path(args.runner_path).expanduser().resolve().parent),
+                env=environment,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                check=True,
+              )
+            except subprocess.CalledProcessError:
+              log_handle.flush()
+              job.update(summarize_failure_log(log_path))
+              raise
           valid, validation = validate_pose_json(
             pose_path, frames, mesh_path, args.min_pose_coverage,
           )
@@ -500,6 +539,16 @@ def main() -> None:
       if state["jobs"].get(sequence, {}).get("status") == "failed"
       and "No MV-SAM3D" in state["jobs"].get(sequence, {}).get("error", "")
     ],
+    "failures": {
+      sequence: {
+        "split": state["jobs"].get(sequence, {}).get("split"),
+        "error": state["jobs"].get(sequence, {}).get("error"),
+        "error_summary": state["jobs"].get(sequence, {}).get("error_summary"),
+        "log": state["jobs"].get(sequence, {}).get("log"),
+      }
+      for sequence in sequences
+      if state["jobs"].get(sequence, {}).get("status") == "failed"
+    },
     "status_json": str(status_path.resolve()),
   }
   atomic_write_json(summary_path, summary)
