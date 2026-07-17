@@ -443,10 +443,26 @@ def main() -> None:
     glctx=glctx,
   )
 
-  def frame_inputs(frame: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+  missing_mask_frames: set[str] = set()
+
+  def frame_inputs(
+    frame: str,
+    require_mask: bool = True,
+  ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     rgb = imageio.imread(by_frame[frame])[..., :3]
     depth = decode_ho3d_depth(find_frame_file(depth_dir, frame))
-    mask = load_mask(find_frame_file(mask_dir, frame), rgb.shape[:2])
+    try:
+      mask = load_mask(find_frame_file(mask_dir, frame), rgb.shape[:2])
+    except FileNotFoundError:
+      if require_mask:
+        raise
+      mask = np.zeros(rgb.shape[:2], dtype=bool)
+      if frame not in missing_mask_frames:
+        print(
+          f"[WARN] frame={frame} has no object mask; continuing tracking without mask diagnostics",
+          flush=True,
+        )
+      missing_mask_frames.add(frame)
     K = intrinsics_by_frame[frame]
     if depth.shape != rgb.shape[:2]:
       raise ValueError(f"Depth/RGB shape mismatch for {frame}: {depth.shape} vs {rgb.shape[:2]}")
@@ -622,6 +638,8 @@ def main() -> None:
       "scale_json": str(scale_json_path) if scale_json_path else None,
       "num_intrinsics_fallback_frames": len(intrinsics_fallback_sources),
       "intrinsics_fallback_by_frame": intrinsics_fallback_sources,
+      "num_missing_mask_frames": len(missing_mask_frames),
+      "missing_mask_frames": sorted(missing_mask_frames, key=int),
       **scale_info,
       "frames": ordered_rows,
       "by_frame": ordered_rows,
@@ -634,7 +652,10 @@ def main() -> None:
     pose = np.asarray(pose, dtype=np.float64).reshape(4, 4)
     if not np.isfinite(pose).all():
       raise RuntimeError(f"FoundationPose returned a non-finite pose for frame {frame}")
-    rgb, depth, mask, K = frame_inputs(frame)
+    rgb, depth, mask, K = frame_inputs(
+      frame,
+      require_mask=mode.startswith("register"),
+    )
     rows[frame] = pose_record(
       frame,
       pose,
@@ -657,7 +678,7 @@ def main() -> None:
 
   estimator.pose_last = init_state.detach().clone()
   for frame in selected[init_index + 1:]:
-    rgb, depth, _, K = frame_inputs(frame)
+    rgb, depth, _, K = frame_inputs(frame, require_mask=False)
     pose = estimator.track_one(
       rgb=rgb,
       depth=tracking_depth(depth),
@@ -669,7 +690,7 @@ def main() -> None:
   if args.bidirectional:
     estimator.pose_last = init_state.detach().clone()
     for frame in reversed(selected[:init_index]):
-      rgb, depth, _, K = frame_inputs(frame)
+      rgb, depth, _, K = frame_inputs(frame, require_mask=False)
       pose = estimator.track_one(
         rgb=rgb,
         depth=tracking_depth(depth),
