@@ -26,6 +26,14 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--approved_sequences_json", required=True)
   parser.add_argument("--mv_status_json", default=None)
   parser.add_argument("--mv_visualization_root", required=True)
+  parser.add_argument(
+    "--tracking_mesh_overrides_json",
+    default=None,
+    help=(
+      "Optional JSON mapping sequence names to lower-face tracking meshes. "
+      "Metric scale is still read from the original MV-SAM3D params.npz."
+    ),
+  )
   parser.add_argument("--ho3d_root", required=True)
   parser.add_argument("--out_root", required=True)
   parser.add_argument("--foundationpose_python", required=True)
@@ -62,6 +70,26 @@ def parse_args() -> argparse.Namespace:
 
 def load_json(path: str | Path) -> Any:
   return json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+
+
+def load_tracking_mesh_overrides(path: str | None) -> dict[str, Path]:
+  if path is None:
+    return {}
+  payload = load_json(path)
+  values = payload.get("by_sequence", payload) if isinstance(payload, dict) else None
+  if not isinstance(values, dict):
+    raise TypeError("tracking mesh overrides JSON must be an object mapping sequence to path")
+  overrides: dict[str, Path] = {}
+  for sequence, value in values.items():
+    if isinstance(value, dict):
+      value = value.get("mesh_file", value.get("tracking_mesh"))
+    if not isinstance(value, str) or not value:
+      raise ValueError(f"Invalid tracking mesh override for {sequence}: {value!r}")
+    mesh_path = Path(value).expanduser().resolve()
+    if not mesh_path.is_file():
+      raise FileNotFoundError(f"Tracking mesh override does not exist: {mesh_path}")
+    overrides[str(sequence)] = mesh_path
+  return overrides
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:
@@ -456,6 +484,10 @@ def main() -> None:
     "test": args.test_manifest_jsonl,
   })
   status_payload = load_json(args.mv_status_json) if args.mv_status_json else {}
+  tracking_mesh_overrides = load_tracking_mesh_overrides(args.tracking_mesh_overrides_json)
+  unknown_overrides = sorted(set(tracking_mesh_overrides) - set(approved))
+  if unknown_overrides:
+    raise ValueError(f"Tracking mesh overrides are not approved sequences: {unknown_overrides}")
   visualization_root = Path(args.mv_visualization_root).expanduser().resolve()
   ho3d_root = Path(args.ho3d_root).expanduser().resolve()
   out_root = Path(args.out_root).expanduser().resolve()
@@ -486,6 +518,7 @@ def main() -> None:
       if mesh_path is None:
         raise FileNotFoundError(f"No MV-SAM3D result.glb found for {sequence}")
       mesh_scale, mesh_params_path = resolve_mv_mesh_scale(mesh_path)
+      tracking_mesh_path = tracking_mesh_overrides.get(sequence, mesh_path)
       sequence_dir = ho3d_root / sequence
       frames = sequence_rgb_frames(sequence_dir)
       candidates, rejected = select_init_candidates(
@@ -500,7 +533,7 @@ def main() -> None:
       out_dir = out_root / split / sequence
       pose_path = out_dir / "foundationpose_poses.json"
       valid, validation = validate_pose_json(
-        pose_path, frames, mesh_path, args.min_pose_coverage,
+        pose_path, frames, tracking_mesh_path, args.min_pose_coverage,
         expected_mesh_scale=mesh_scale,
       )
       job.update({
@@ -508,6 +541,8 @@ def main() -> None:
         "mv_glb_source": mesh_source,
         "mv_params_npz": str(mesh_params_path),
         "mv_mesh_scale": mesh_scale,
+        "tracking_mesh": str(tracking_mesh_path),
+        "tracking_mesh_override": sequence in tracking_mesh_overrides,
         "out_dir": str(out_dir),
         "pose_json": str(pose_path),
         "num_rgb_frames": len(frames),
@@ -526,7 +561,7 @@ def main() -> None:
           sequence,
           frames,
           candidates,
-          mesh_path,
+          tracking_mesh_path,
           mesh_scale,
           out_dir,
           overwrite_output=args.force or pose_path.exists(),
@@ -556,7 +591,7 @@ def main() -> None:
               job.update(summarize_failure_log(log_path))
               raise
           valid, validation = validate_pose_json(
-            pose_path, frames, mesh_path, args.min_pose_coverage,
+            pose_path, frames, tracking_mesh_path, args.min_pose_coverage,
             expected_mesh_scale=mesh_scale,
           )
           job["validation_after"] = validation

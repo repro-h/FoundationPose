@@ -8,6 +8,7 @@ import numpy as np
 from run_ho3d_approved_batch import (
   approved_sequence_entries,
   choose_distributed_candidates,
+  load_tracking_mesh_overrides,
   resolve_mv_glb,
   resolve_mv_mesh_scale,
   summarize_failure_log,
@@ -90,6 +91,20 @@ class ApprovedBatchTests(unittest.TestCase):
       scale, params = resolve_mv_mesh_scale(mesh)
       self.assertAlmostEqual(scale, 0.19)
       self.assertEqual(params, (root / "params.npz").resolve())
+
+  def test_tracking_mesh_overrides(self):
+    with tempfile.TemporaryDirectory() as temporary:
+      root = Path(temporary)
+      mesh = root / "tracking.ply"
+      mesh.touch()
+      path = root / "overrides.json"
+      path.write_text(json.dumps({
+        "by_sequence": {"GPMF14": {"mesh_file": str(mesh)}}
+      }))
+      self.assertEqual(
+        load_tracking_mesh_overrides(str(path)),
+        {"GPMF14": mesh.resolve()},
+      )
 
   def test_pose_validation_requires_full_matching_mv_track(self):
     with tempfile.TemporaryDirectory() as temporary:
