@@ -35,7 +35,12 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--pose_json", required=True)
   parser.add_argument("--out_dir", required=True)
   parser.add_argument("--mesh_file", default=None)
-  parser.add_argument("--mesh_scale", type=float, default=1.0)
+  parser.add_argument(
+    "--mesh_scale",
+    type=float,
+    default=None,
+    help="Override mesh scale; defaults to source_mesh_scale from the pose JSON.",
+  )
   parser.add_argument("--frame_stride", type=int, default=20)
   parser.add_argument("--frames", type=int, nargs="+", default=None)
   parser.add_argument("--depth_tolerance_mm", type=float, default=12.0)
@@ -141,7 +146,12 @@ def main() -> None:
   if not model_value:
     raise ValueError("No mesh path in arguments or pose JSON")
   model_path = Path(str(model_value)).expanduser().resolve()
-  mesh, _ = load_mesh_file(model_path, args.mesh_scale)
+  mesh_scale = (
+    float(args.mesh_scale)
+    if args.mesh_scale is not None
+    else float(payload.get("source_mesh_scale", 1.0))
+  )
+  mesh, _ = load_mesh_file(model_path, mesh_scale)
   mesh_tensors = make_mesh_tensors(mesh, device="cuda")
   glctx = dr.RasterizeCudaContext()
 
@@ -213,6 +223,7 @@ def main() -> None:
     "sequence": args.sequence,
     "pose_json": str(pose_path),
     "mesh_file": str(model_path),
+    "mesh_scale": mesh_scale,
     "num_pose_frames": len(available),
     "num_rendered_frames": len(rows),
     "frame_stride": args.frame_stride,
