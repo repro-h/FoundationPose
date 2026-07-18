@@ -35,7 +35,10 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   B = len(ob_in_cams)
   poseA = torch.as_tensor(ob_in_cams, dtype=torch.float, device='cuda')
 
-  bs = 512
+  # High-resolution reconstructed meshes can make the 252 registration
+  # hypotheses exceed a 24 GB GPU when rendered in one call. Keep the
+  # historical default, but allow inference wrappers to lower the peak.
+  bs = max(1, int(os.environ.get('FOUNDATIONPOSE_RENDER_BATCH_SIZE', '512')))
   rgb_rs = []
   depth_rs = []
   normal_rs = []
