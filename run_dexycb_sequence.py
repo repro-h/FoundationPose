@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--refine_weights_dir", default=None)
   parser.add_argument("--debug", type=int, default=1)
   parser.add_argument("--save_overlays", action="store_true")
+  parser.add_argument("--overlay_stride", type=int, default=1)
   parser.add_argument("--overwrite", action="store_true")
   return parser.parse_args()
 
@@ -165,6 +166,8 @@ def main() -> None:
   args = parse_args()
   if args.frame_stride < 1:
     raise ValueError("--frame_stride must be >= 1")
+  if args.overlay_stride < 1:
+    raise ValueError("--overlay_stride must be >= 1")
   set_logging_format()
   set_seed(0)
 
@@ -187,6 +190,7 @@ def main() -> None:
   if not selected:
     raise ValueError(f"No selected frames in {stream_dir}")
   width = max(len(frame) for frame in selected)
+  selected_index = {frame: index for index, frame in enumerate(selected)}
   init_frame = f"{args.init_frame:0{width}d}" if args.init_frame is not None else selected[0]
   if init_frame not in selected:
     raise ValueError(f"init frame {init_frame} is absent from selected frames")
@@ -264,6 +268,9 @@ def main() -> None:
       "meta_path": str(meta_path),
       "init_frame": init_frame,
       "bidirectional": bool(args.bidirectional),
+      "complete": len(ordered) == len(selected),
+      "num_selected_frames": len(selected),
+      "num_completed_frames": len(ordered),
       "model_source": "mesh_file",
       "model_path": str(mesh_path),
       "mesh_file": str(mesh_path),
@@ -298,7 +305,15 @@ def main() -> None:
       "depth_path": depth_files[frame],
     }
     np.savetxt(out_dir / f"{frame}.txt", pose)
-    if args.save_overlays:
+    save_overlay = (
+      args.save_overlays
+      and (
+        frame == init_frame
+        or selected_index[frame] % args.overlay_stride == 0
+        or frame == selected[-1]
+      )
+    )
+    if save_overlay:
       imageio.imwrite(overlay_dir / f"{frame}.jpg", render_overlay(rgb, pose))
     write_payload()
     print(f"[{len(rows)}/{len(selected)}] frame={frame} mode={mode} t={pose[:3, 3].tolist()}", flush=True)
